@@ -1,6 +1,6 @@
 import numpy as np
 
-class Instruments:
+class Tools:
     @staticmethod
     def smooth_edge_weights(sim, threshold_weight):
         weights = list(sim.values())
@@ -29,3 +29,4 @@ class Instruments:
 
 
         return smoothed_sim
+
