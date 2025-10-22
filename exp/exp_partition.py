@@ -25,7 +25,7 @@ from exp.methods.GetEmbed import GetEmbed as ge
 from exp.methods.Louvain import Louvain
 from exp.methods.WeightOptimizer import EdgeWeightOptimizer
 import torch.optim as optim
-from instruments import Instruments
+from tools import Tools
 from exp.methods.CCD import CentroidCommunityDetection as CCD
 from exp.methods.Infomap import Infomap
 
@@ -298,6 +298,8 @@ class GraphCommunityPartition(Exp):
         plt.title('Distance and Gradient Plot')
         plt.show()
 
+    '''
+
     def aggregate_labels_th1(self, c2n, np_new_feats):
         Y = self.graph.ndata['label'].numpy()
         X = self.graph.ndata['feat'].numpy()
@@ -330,6 +332,8 @@ class GraphCommunityPartition(Exp):
 
         # Return both the new labels and the set of all selected nodes
         return np_new_labels, selected_nodes_set
+
+        '''
 
     def aggregate_labels_kmeans(self, c2n, np_new_feats):
         """
@@ -592,6 +596,7 @@ class GraphCommunityPartition(Exp):
                 self.logger.info(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {loss.item():.4f}")
 
         return optimizer_model.calculate_sim()
+
 
 
 
