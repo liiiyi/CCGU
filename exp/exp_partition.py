@@ -25,14 +25,12 @@ from exp.methods.GetEmbed import GetEmbed as ge
 from exp.methods.Louvain import Louvain
 from exp.methods.WeightOptimizer import EdgeWeightOptimizer
 import torch.optim as optim
-from tools import Tools
 from exp.methods.CCD import CentroidCommunityDetection as CCD
 from exp.methods.Infomap import Infomap
 
 class GraphCommunityPartition(Exp):
     def __init__(self, args):
         super(GraphCommunityPartition, self).__init__(args)
-        self.instrument = Instruments
         self.slpa_time = None
         self.logger = logging.getLogger('ExpPartition')
         self.args = args
@@ -596,6 +594,7 @@ class GraphCommunityPartition(Exp):
                 self.logger.info(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {loss.item():.4f}")
 
         return optimizer_model.calculate_sim()
+
 
 
 
