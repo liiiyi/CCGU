@@ -62,7 +62,86 @@ class GraphCommunityPartition(Exp):
         self.logger.info(f'Time Consumption of Partition: {self.time_partition}')
         self.logger.info(f'Time Consumption of Calculation: {calculate_time}')
 
+    def load_data(self):
+        if self.args['dgl_data']:
+            self.graph = self.data_store.load_graph_from_dgl()
+            self.num_nodes = self.graph.number_of_nodes()
+            np.set_printoptions(threshold=np.inf)
+        else:
+            self.data = self.data_store.load_raw_data()
+            self.gen_train_graph()
 
+    def gen_train_graph(self):
+        edges = [(self.data.edge_index[0][i], self.data.edge_index[1][i]) for i in range(self.data.edge_index[0].shape[0])]
+        nodes = set(edge[0] for edge in edges) | set(edge[1] for edge in edges)
+        self.graph = nx.Graph()
+        self.graph.add_nodes_from(nodes)
+        self.graph.add_edges_from(edges)
+
+    def gen_community(self):
+        #TODO: if exsit, load
+        if os.path.exists(self.data_store.community_file):
+            self.logger.info("Community file exists. Loading the file.")
+            com_data = self.data_store.load_communities_info()
+            n2c = com_data['n2c']
+            c2n = com_data['c2n']
+            num_communities = com_data['num_c']
+
+            self.time_partition = 'Partition File is already exist.'
+        else:
+            if self.args['partition'] == 'slpa':
+                slpa = SLPA(self.graph, max_iterations=50, threshold=0.2, max_communities_per_node=5)
+                n2c, c2n, num_communities, self.time_partition = slpa.SLPA_partition()
+            elif self.args['partition'] == 'oslom':
+                oslom = OSLOM(self.graph, args=self.args)
+                n2c, c2n, num_communities, self.time_partition = oslom.OSLOM_partition()
+            elif self.args['partition'] == 'infomap':
+                infomap = Infomap(self.graph, args=self.args)
+                n2c, c2n, num_communities, self.time_partition = infomap.partition()
+            elif self.args['partition'] == 'test':
+                ccd = CCD(self.graph, args=self.args)
+                n2c, c2n, self.time_partition = ccd.run()
+                num_communities = len(c2n)
+            else:
+                self.logger.info("Error Method Name.")
+                return 1
+
+            com_data = {
+                'n2c': n2c,
+                'c2n': c2n,
+                'num_c': num_communities
+            }
+            self.data_store.save_communities_info(params=com_data)
+
+        self._check_communities(c2n)
+
+        return n2c, c2n, num_communities
+
+    def _check_communities(self, c2n):
+        # Initialize a dictionary to count the occurrences of each node in communities
+        node_counts = {}
+
+        # Count the number of times each node appears in the communities
+        for community, nodes in c2n.items():
+            for node in nodes:
+                if node not in node_counts:
+                    node_counts[node] = 0
+                node_counts[node] += 1
+
+        # Initialize a dictionary to count the number of nodes that overlap a specific number of times
+        overlap_counts = {i: 0 for i in range(1, 6)}
+
+        # Count the number of nodes that overlap 1, 2, 3, 4, or 5 times
+        for node, count in node_counts.items():
+            if count in overlap_counts:
+                overlap_counts[count] += 1
+            else:
+                overlap_counts[5] += 1  # Count nodes that overlap more than 5 times as 5
+
+        self.logger.info(f"Number of communities: {len(c2n)}")
+        # Log the results
+        for i in range(1, 6):
+            self.logger.info(f"Number of nodes overlapping {i} time(s): {overlap_counts[i]}")
 
     def aggregate(self):
 
@@ -122,9 +201,6 @@ class GraphCommunityPartition(Exp):
 
         return time.time() - start_time
 
-
-
-
     def generate_masks(self, num, test_size=0.2):
         """
         Param
@@ -141,89 +217,6 @@ class GraphCommunityPartition(Exp):
         test_mask[test] = True
         return train_mask, val_mask, test_mask
 
-
-    def load_data(self):
-        if self.args['dgl_data']:
-            self.graph = self.data_store.load_graph_from_dgl()
-            self.num_nodes = self.graph.number_of_nodes()
-            np.set_printoptions(threshold=np.inf)
-        else:
-            self.data = self.data_store.load_raw_data()
-            self.gen_train_graph()
-
-    def gen_train_graph(self):
-        edges = [(self.data.edge_index[0][i], self.data.edge_index[1][i]) for i in range(self.data.edge_index[0].shape[0])]
-        nodes = set(edge[0] for edge in edges) | set(edge[1] for edge in edges)  # 从边集中提取所有唯一的节点
-        self.graph = nx.Graph()
-        self.graph.add_nodes_from(nodes)
-        self.graph.add_edges_from(edges)
-
-    def gen_community(self):
-        #TODO: if exsit, load
-        if os.path.exists(self.data_store.community_file):
-            self.logger.info("Community file exists. Loading the file.")
-            com_data = self.data_store.load_communities_info()
-            n2c = com_data['n2c']
-            c2n = com_data['c2n']
-            num_communities = com_data['num_c']
-
-            self.time_partition = 'Partition File is already exist.'
-        else:
-            if self.args['partition'] == 'slpa':
-                slpa = SLPA(self.graph, max_iterations=50, threshold=0.2, max_communities_per_node=5)
-                n2c, c2n, num_communities, self.time_partition = slpa.SLPA_partition()
-            elif self.args['partition'] == 'oslom':
-                oslom = OSLOM(self.graph, args=self.args)
-                n2c, c2n, num_communities, self.time_partition = oslom.OSLOM_partition()
-            elif self.args['partition'] == 'infomap':
-                infomap = Infomap(self.graph, args=self.args)
-                n2c, c2n, num_communities, self.time_partition = infomap.partition()
-            elif self.args['partition'] == 'test':
-                ccd = CCD(self.graph, args=self.args)
-                n2c, c2n, self.time_partition = ccd.run()
-                num_communities = len(c2n)
-            else:
-                self.logger.info("Error Method Name.")
-                return 1
-
-            # 存储c2n
-            com_data = {
-                'n2c': n2c,
-                'c2n': c2n,
-                'num_c': num_communities
-            }
-            self.data_store.save_communities_info(params=com_data)
-
-        self._check_communities(c2n)
-
-        return n2c, c2n, num_communities
-
-    def _check_communities(self, c2n):
-        # Initialize a dictionary to count the occurrences of each node in communities
-        node_counts = {}
-
-        # Count the number of times each node appears in the communities
-        for community, nodes in c2n.items():
-            for node in nodes:
-                if node not in node_counts:
-                    node_counts[node] = 0
-                node_counts[node] += 1
-
-        # Initialize a dictionary to count the number of nodes that overlap a specific number of times
-        overlap_counts = {i: 0 for i in range(1, 6)}
-
-        # Count the number of nodes that overlap 1, 2, 3, 4, or 5 times
-        for node, count in node_counts.items():
-            if count in overlap_counts:
-                overlap_counts[count] += 1
-            else:
-                overlap_counts[5] += 1  # Count nodes that overlap more than 5 times as 5
-
-        self.logger.info(f"Number of communities: {len(c2n)}")
-        # Log the results
-        for i in range(1, 6):
-            self.logger.info(f"Number of nodes overlapping {i} time(s): {overlap_counts[i]}")
-
     def aggregate_features_mean(self, c2n):
         in_feats = self.graph.ndata['feat'].shape[1]
         X = self.graph.ndata['feat'].numpy()
@@ -237,10 +230,9 @@ class GraphCommunityPartition(Exp):
 
     def aggregate_features_pca(self, c2n, n_components_ratio=0.05):
         """
-        使用 PCA 方法聚合社区特征和多数投票方法聚合标签
-        :param c2n: dict, 社区到节点的映射
-        :param n_components_ratio: float, 主成分的比例
-        :return: 聚合后的社区特征和标签
+        :param c2n: dict, C2N
+        :param n_components_ratio: float, PCA
+        :return: FEAT & LABEL
         """
         in_feats = self.graph.ndata['feat'].shape[1]
         X = self.graph.ndata['feat'].numpy()
@@ -249,7 +241,7 @@ class GraphCommunityPartition(Exp):
 
         for community, nodes in c2n.items():
             if len(nodes) <= 1 / n_components_ratio:
-                # 直接返回节点特征的平均值
+
                 community_feature = X[nodes].mean(axis=0)
                 np_new_feats[community] = community_feature
                 distances = np.linalg.norm(X[nodes] - community_feature, axis=1)
@@ -260,20 +252,16 @@ class GraphCommunityPartition(Exp):
                 pca = PCA(n_components=num_components)
                 transformed_feats = pca.fit_transform(X[nodes].T)
 
-                # 计算社区特征（质心）
                 community_feature = transformed_feats.mean(axis=0)
                 np_new_feats[community] = transformed_feats.mean(axis=1)
 
-                # 计算特征健壮度
                 distances = np.linalg.norm(transformed_feats - community_feature, axis=1)
 
             feature_robustness[community] = len(nodes) / distances.sum()
 
-        # 平滑处理特征健壮性评分
         # instru = Instruments
         # smoothed_robustness = instru.smooth_edge_weights(feature_robustness, threshold_weight=0.5)
 
-        # 如果use_feat_rb为True，则将特征健壮性评分加入np_new_feats中
         if self.args['use_feat_rb']:
             for community, robustness in feature_robustness.items():
                 robustness = 0.1 * np.exp(-robustness) + 1.0
@@ -345,10 +333,9 @@ class GraphCommunityPartition(Exp):
 
     def aggregate_labels_kmeans(self, c2n, np_new_feats):
         """
-        使用 K-means 聚类去噪方法聚合社区标签
-        :param c2n: dict, 社区到节点的映射
-        :param np_new_feats: np.array, 社区的平均特征
-        :return: 聚合后的社区标签, 计算时间
+        :param c2n: dict, C2N
+        :param np_new_feats: np.array, MEAN_FEAT
+        :return: COMM_LABEL
         """
         Y = self.graph.ndata['label'].numpy()
         X = self.graph.ndata['feat'].numpy()
@@ -379,10 +366,9 @@ class GraphCommunityPartition(Exp):
 
     def aggregate_labels_th(self, c2n, np_new_feats):
         """
-        使用距离阈值和多数投票方法聚合标签
-        :param c2n: dict, 社区到节点的映射
-        :param np_new_feats: ndarray, 聚合后的社区特征
-        :return: 聚合后的社区标签和运行时间
+        :param c2n: dict, C2N
+        :param np_new_feats: ndarray, FEAT
+        :return: COMM_LABEL
         """
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -402,17 +388,13 @@ class GraphCommunityPartition(Exp):
                 [euclidean(np_new_feats[community].cpu().numpy(), node_feat.cpu().numpy()) for node_feat in
                  community_features], device=device)
 
-            # 计算自动阈值
             threshold = self.calculate_threshold(distances.cpu().numpy())
 
-            # 选择距离小于阈值的节点
             selected_nodes = nodes[distances <= threshold]
 
             if len(selected_nodes) > 0:
-                # 如果有节点满足阈值条件，则选择这些节点的多数标签
                 np_new_labels[community] = mode(Y[selected_nodes].cpu().numpy())[0][0]
             else:
-                # 如果没有节点满足阈值条件，则选择所有节点的多数标签
                 np_new_labels[community] = mode(Y[nodes].cpu().numpy())[0][0]
 
         end_time = time.time()
@@ -426,9 +408,8 @@ class GraphCommunityPartition(Exp):
 
     def aggregate_labels_all(self, c2n):
         """
-        使用简单的多数投票方法聚合社区内所有节点的标签
-        :param c2n: dict, 社区到节点的映射
-        :return: 聚合后的社区标签
+        :param c2n: dict, C2N
+        :return: COMM_LABEL
         """
         Y = self.graph.ndata['label'].numpy()
         np_new_labels = np.zeros(len(c2n), dtype='int64')
@@ -568,13 +549,10 @@ class GraphCommunityPartition(Exp):
 
                         if out_degree_A > 0 and in_degree_B > 0:
                             if test_edge_method == 0:
-                                # Method 1: (A到B的边数/A的出度) * (A到B的边数/B的入度) * Jaccard相似系数
                                 robustness_A2B = (edge_count / math.sqrt(out_degree_A)) * (edge_count / math.sqrt(in_degree_B))
                             elif test_edge_method == 1:
-                                # Method 2: log(1 + A到B的边数) / (log(1 + A的出度) + log(1 + B的入度)) * Jaccard相似系数
                                 robustness_A2B = log(1 + edge_count) / (log(1 + out_degree_A) + log(1 + in_degree_B))
                             elif test_edge_method == 2:
-                                # Method 3: (log(1 + 边数量_A_to_B) / sqrt(log(1 + 社区A的出度))) * (log(1 + 边数量_A_to_B) / sqrt(log(1 + 社区B的入度)))
                                 log_edge_count = math.log1p(edge_count)
                                 log_out_degree_A = math.log1p(out_degree_A)
                                 log_in_degree_B = math.log1p(in_degree_B)
