@@ -6,7 +6,6 @@
 
 ## Overview
 This repository provides the implementation of **Community-Centric Graph Unlearning (CCGU)** proposed in our AAAI 2025 paper.  
-CCGU enables efficient graph unlearning via **community-level partitioning, aggregation, and forgetting**, preserving learning accuracy while ensuring strong unlearning guarantees.
 
 Most experiments were conducted with **Python 3.7** and **DGL**, while a small portion (e.g., GraphEraser comparisons) were based on **Python 3.6** and **PyTorch Geometric (PyG)**.
 
