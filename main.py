@@ -10,6 +10,7 @@ from exp.exp_partition import GraphCommunityPartition
 from exp.exp_train import TrainModel
 from exp.exp_draw import ExpDraw
 from exp.Evaluate import Evaluate
+# from exp.exp_unlearn import Unlearn
 
 def _set_random_seed(seed=2022):
     
@@ -60,3 +61,7 @@ if __name__ == "__main__":
         ExpDraw(args)
     elif args["exp"].lower() == "eva":
         Evaluate(args)
+    '''
+    elif args["exp"].lower() == "unlearn":
+        Unlearn(args)
+    '''
