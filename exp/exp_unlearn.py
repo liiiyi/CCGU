@@ -1,247 +1,560 @@
+import copy
 import logging
-import math
-import os.path
-
-import matplotlib.pyplot as plt
-import networkx as nx
-
-from exp.exp import Exp
-from exp.methods.SLPA import SLPA
-from exp.methods.OSLOM import OSLOM
-from exp.methods.NIKM import NIKM
-from sklearn.decomposition import PCA
-from scipy.spatial.distance import euclidean
-import numpy as np
-from scipy.stats import mode
-from tqdm import tqdm
-from sklearn.model_selection import train_test_split
-from collections import defaultdict
-from math import log
-import config
+import os
+import random
 import time
+
+import dgl
+import numpy as np
 import torch
+import torch.nn.functional as F
+from scipy.spatial.distance import euclidean
+from scipy.stats import mode
+from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
-from exp.methods.GetEmbed import GetEmbed as ge
-from exp.methods.Louvain import Louvain
+from sklearn.metrics import accuracy_score, f1_score
+
+import config
+from exp.exp import Exp
+from exp.unlearning_core import (
+    build_node_to_communities,
+    calculate_edge_counts,
+    calculate_robustness_similarity,
+    remap_rows,
+    remove_nodes_and_reindex,
+)
+from lib_gnn_model.node_classifier_dgl import NodeClassifierDGL
 from exp.methods.WeightOptimizer import EdgeWeightOptimizer
-import torch.optim as optim
-from exp.methods.CCD import CentroidCommunityDetection as CCD
-from exp.methods.Infomap import Infomap
+
 
 class Unlearn(Exp):
+    """Community update followed by deterministic mapped-graph retraining."""
+
     def __init__(self, args):
         super(Unlearn, self).__init__(args)
         self.nucleus_graph = None
-        self.logger = logging.getLogger('ExpUnlearn')
+        self.logger = logging.getLogger("ExpUnlearn")
         self.load_data()
 
-        set_file = config.COM_PATH + self.args['dataset_name'] + "/" + self.args['partition'] + '_select_n'
-        selected_nodes = self.data_store.save_param(address=set_file)
-
-        stime = time.time()
-        inf = self.gen_unlearning_influence(selected_nodes)
-        self.unlearning(inf)
-        unlearn_time = time.time() - stime
-
-        config_str = (
-            f"\n"
-            f"Dataset Name: {args['dataset_name']}\n"
-            f"Aggregation Feature Method: {args['agg_feat']}\n"
-            f"Aggregation Label Method: {args['agg_label']}\n"
-            f"Aggregation Edge Method: {args['agg_edge']}\n"
-            f"Partition Method: {args['partition']}\n"
-            f"Threshold Similarity to Edge: {args['th_sim2edge']}\n"
-            f"Test Edge Method: {args['test_edge_method']}\n"
-            f"Use Edge Weight: {args['use_edge_weight']}\n"
-            f"GNN Model: {args['target_model']}"
+        set_file = (
+            config.COM_PATH
+            + self.args["dataset_name"]
+            + "/"
+            + self.args["partition"]
+            + "_select_n"
         )
-        self.logger.info(config_str)
+        selected_nodes = (
+            self.data_store.load_param(address=set_file)
+            if os.path.exists(set_file)
+            else set()
+        )
 
-        self.logger.info(f'Unlearn time: {unlearn_time} seconds')
+        start_time = time.time()
+        influence = self.gen_unlearning_influence(selected_nodes)
+        self.unlearning(influence)
+        self.retrain_model()
+        self.unlearn_time = time.time() - start_time
+
+        self.logger.info(
+            "Unlearning completed: %d original nodes, %d affected communities, %.4f seconds",
+            len(influence["unlearning_nodes"]),
+            len(influence["unlearning_communities"]),
+            self.unlearn_time,
+        )
 
     def load_data(self):
-        if self.args['dgl_data']:
-            self.graph = self.data_store.load_graph_from_dgl()
-            self.num_nodes = self.graph.number_of_nodes()
-            np.set_printoptions(threshold=np.inf)
-        else:
-            self.data = self.data_store.load_raw_data()
-            self.gen_train_graph()
-    
-    def gen_unlearning_influence(self):
-        # N2C
-        self.n2c = {}  # node -> list of communities
-        for community, nodes in self.c2n.items():
-            for node in nodes:
-                if node not in self.n2c:
-                    self.n2c[node] = []
-                self.n2c[node].append(community)
+        """Load the original DGL graph and the deployed mapped-graph artifacts."""
+        if not self.args["dgl_data"]:
+            raise ValueError("CGE unlearning requires the existing DGL data interface.")
 
-        self.logger.info(f"Constructed node-to-community mapping with {len(self.n2c)} nodes.")
+        self.graph = self.data_store.load_graph_from_dgl()
+        self.num_nodes = self.graph.number_of_nodes()
 
-        # GEN UNLEARNING REQUEST
-        unlearn_ratio = self.args['unlearn_ratio']
-        all_nodes = list(self.n2c.keys())
+        community_data = self.data_store.load_communities_info()
+        self.n2c = community_data["n2c"]
+        self.c2n = community_data["c2n"]
+        self.num_communities = community_data["num_c"]
 
-        num_all_nodes = len(all_nodes)
+        nucleus_data = self.data_store.load_nucleus_data(if_sim=0)
+        self.new_feats = np.asarray(nucleus_data["new_feats"]).copy()
+        self.new_labels = np.asarray(nucleus_data["new_labels"]).copy()
+        self.train_mask = np.asarray(nucleus_data["train_mask"], dtype=bool).copy()
+        self.val_mask = np.asarray(nucleus_data["val_mask"], dtype=bool).copy()
+        self.test_mask = np.asarray(nucleus_data["test_mask"], dtype=bool).copy()
+        self.sim = dict(self.data_store.load_nucleus_data(if_sim=1))
+
+    def gen_unlearning_influence(self, selected_nodes=None):
+        """Sample a training-node request and locate every overlapping community."""
+        del selected_nodes  # Kept for compatibility with the historical method call.
+        self.n2c = build_node_to_communities(self.c2n)
+
+        training_communities = {
+            community
+            for community, is_training in enumerate(self.train_mask)
+            if is_training and community in self.c2n
+        }
+        training_nodes = sorted(
+            {
+                int(node)
+                for community in training_communities
+                for node in self.c2n[community]
+            }
+        )
+        if not training_nodes:
+            raise ValueError("No training nodes are available for unlearning.")
+
+        unlearn_ratio = self.args["unlearn_ratio"]
         if unlearn_ratio > 1:
             num_unlearning_nodes = int(unlearn_ratio)
         elif 0 < unlearn_ratio <= 1:
-            num_unlearning_nodes = int(unlearn_ratio * num_all_nodes)
+            num_unlearning_nodes = max(1, int(unlearn_ratio * len(training_nodes)))
         else:
-            raise ValueError("Invalid unlearn_ratio value")
+            raise ValueError("unlearn_ratio must be positive.")
+        if num_unlearning_nodes > len(training_nodes):
+            raise ValueError("unlearn_ratio requests more nodes than the training set contains.")
 
-        unlearning_set = random.sample(all_nodes, num_unlearning_nodes)
-        self.unlearning_set = unlearning_set
-
-        self.logger.info(f"[Unlearning] Selected {num_unlearning_nodes} nodes for unlearning.")
-
-        # Confirm Affected Communities
-        unlearning_communities = set()
-        for node in unlearning_set:
-            if node in self.n2c:
-                unlearning_communities.update(self.n2c[node])
-
-        self.logger.info(f"[Unlearning] {len(unlearning_communities)} communities are affected.")
-
-        # RECULCULATE
-        features_communities = set(unlearning_communities)
-        labels_communities = set(unlearning_communities)
-
-        sim_communities_pairs = set()
-        for (comm1, comm2), _ in self.sim.items():
-            if comm1 in unlearning_communities or comm2 in unlearning_communities:
-                sim_communities_pairs.add((comm1, comm2))
-
-        self.logger.info(f"[Recalc] {len(features_communities)} feature communities, "
-                         f"{len(labels_communities)} label communities, "
-                         f"{len(sim_communities_pairs)} sim pairs need recalculation.")
-
-        # DICT
-        influence_dict = {
-            'features_communities': features_communities,
-            'labels_communities': labels_communities,
-            'sim_communities_pairs': sim_communities_pairs,
-            'unlearning_nodes': unlearning_set,
-            'unlearning_communities': unlearning_communities
+        unlearning_nodes = random.sample(training_nodes, num_unlearning_nodes)
+        unlearning_communities = {
+            community
+            for node in unlearning_nodes
+            for community in self.n2c.get(node, ())
+        }
+        sim_pairs = {
+            pair
+            for pair in self.sim
+            if pair[0] in unlearning_communities
+            or pair[1] in unlearning_communities
         }
 
+        influence_dict = {
+            "features_communities": set(unlearning_communities),
+            "labels_communities": set(unlearning_communities),
+            "sim_communities_pairs": sim_pairs,
+            "unlearning_nodes": unlearning_nodes,
+            "unlearning_communities": unlearning_communities,
+        }
+        self.unlearning_set = unlearning_nodes
         self.influence_dict = influence_dict
-        self.logger.info("[Unlearning] Influence dictionary successfully generated and stored.")
-
         return influence_dict
-    
+
     def calculate_threshold(self, distances):
         if len(distances) <= 1:
             return np.inf
         sorted_distances = np.sort(distances)
-        gradients = np.gradient(sorted_distances)
-        max_gradient_idx = np.argmax(gradients)
-        threshold = sorted_distances[max_gradient_idx]
-        return threshold
+        gradients = np.diff(sorted_distances)
+        return sorted_distances[int(np.argmax(gradients))]
 
     def unlearning(self, influence_dict):
-        features_communities = influence_dict['features_communities']
-        labels_communities = influence_dict['labels_communities']
-        sim_communities_pairs = influence_dict['sim_communities_pairs']
+        """Update communities and rebuild all data derived from deleted nodes."""
+        (
+            updated_c2n,
+            old_to_new,
+            _affected_old,
+            affected_new,
+        ) = remove_nodes_and_reindex(
+            self.c2n,
+            influence_dict["unlearning_nodes"],
+        )
+        if not updated_c2n:
+            raise ValueError("The unlearning request removed every community.")
 
-        new_feats = self.recalculate_features_pca(features_communities)
+        self.c2n = updated_c2n
+        self.n2c = build_node_to_communities(self.c2n)
+        self.num_communities = len(self.c2n)
 
-        new_labels = self.recalculate_labels_th1(labels_communities, new_feats)
+        self.new_feats = np.asarray(remap_rows(self.new_feats, old_to_new))
+        self.new_labels = np.asarray(remap_rows(self.new_labels, old_to_new))
+        self.train_mask = np.asarray(remap_rows(self.train_mask, old_to_new), dtype=bool)
+        self.val_mask = np.asarray(remap_rows(self.val_mask, old_to_new), dtype=bool)
+        self.test_mask = np.asarray(remap_rows(self.test_mask, old_to_new), dtype=bool)
 
-        new_sim = self.recalculate_sim_rubost(sim_communities_pairs)
+        if self.args["agg_feat"] == "pca":
+            self.new_feats = self.recalculate_features_pca(affected_new)
+        elif self.args["agg_feat"] == "mean":
+            self.new_feats = self.recalculate_features_mean(affected_new)
+        else:
+            raise ValueError("Unlearning supports the existing 'pca' and 'mean' feature mappings.")
+
+        if self.args["agg_label"] == "th":
+            self.new_labels = self.recalculate_labels_th1(
+                affected_new,
+                self.new_feats,
+            )
+        elif self.args["agg_label"] == "all":
+            self.new_labels = self.recalculate_labels_all(affected_new)
+        elif self.args["agg_label"] == "km":
+            self.new_labels = self.recalculate_labels_kmeans(affected_new)
+        else:
+            raise ValueError("Unknown label mapping method.")
+
+        self.sim = self.recalculate_sim_rubost(None)
 
         updated_nucleus_data = {
-            'new_feats': new_feats,
-            'new_labels': new_labels,
+            "new_feats": self.new_feats,
+            "new_labels": self.new_labels,
+            "train_mask": self.train_mask,
+            "val_mask": self.val_mask,
+            "test_mask": self.test_mask,
         }
-        self.data_store.save_nucleus_data(params=updated_nucleus_data, if_sim=0)
-        self.data_store.save_nucleus_data(params=new_sim, if_sim=1)
+        self.data_store.save_communities_info(
+            {
+                "n2c": self.n2c,
+                "c2n": self.c2n,
+                "num_c": self.num_communities,
+            }
+        )
+        self.data_store.save_nucleus_data(updated_nucleus_data, if_sim=0)
+        self.data_store.save_nucleus_data(self.sim, if_sim=1)
+        self.data_store.save_unlearned_data(
+            {
+                "unlearning_nodes": list(influence_dict["unlearning_nodes"]),
+                "unlearning_communities": sorted(
+                    influence_dict["unlearning_communities"]
+                ),
+            },
+            suffix="request",
+        )
 
-        self.new_feats = new_feats
-        self.new_labels = new_labels
-        self.sim = new_sim
+    def _features_numpy(self):
+        features = self.graph.ndata["feat"]
+        if hasattr(features, "detach"):
+            features = features.detach()
+        if hasattr(features, "cpu"):
+            features = features.cpu()
+        return np.asarray(features.numpy())
+
+    def _labels_numpy(self):
+        labels = self.graph.ndata["label"]
+        if hasattr(labels, "detach"):
+            labels = labels.detach()
+        if hasattr(labels, "cpu"):
+            labels = labels.cpu()
+        return np.asarray(labels.numpy())
+
+    def recalculate_features_mean(self, features_communities):
+        features = self._features_numpy()
+        updated = self.new_feats.copy()
+        for community in features_communities:
+            updated[community] = features[self.c2n[community]].mean(axis=0)
+        return updated.astype("float32", copy=False)
 
     def recalculate_features_pca(self, features_communities):
-        in_feats = self.graph.ndata['feat'].shape[1]
-        X = self.graph.ndata['feat'].numpy()
-        np_new_feats = np.zeros((len(self.c2n), in_feats), dtype='float32')
+        """Recompute Equation (5) for affected, non-empty communities."""
+        features = self._features_numpy()
+        updated = self.new_feats.copy()
+        n_components_ratio = 0.05
 
         for community in features_communities:
             nodes = self.c2n[community]
-            if len(nodes) <= 1 / self.args['n_components_ratio']:
-                np_new_feats[community] = X[nodes].mean(axis=0)
+            if len(nodes) <= 1 / n_components_ratio:
+                community_feature = features[nodes].mean(axis=0)
+                distances = np.linalg.norm(
+                    features[nodes] - community_feature,
+                    axis=1,
+                )
             else:
-                pca = PCA(n_components=max(1, int(np.ceil(len(nodes) * self.args['n_components_ratio']))))
-                transformed_feats = pca.fit_transform(X[nodes].T)
-                np_new_feats[community] = transformed_feats.mean(axis=1)
+                num_components = max(
+                    1,
+                    int(np.ceil(len(nodes) * n_components_ratio)),
+                )
+                num_components = min(num_components, features.shape[1])
+                transformed = PCA(n_components=num_components).fit_transform(
+                    features[nodes].T
+                )
+                community_feature = transformed.mean(axis=1)
+                distances = np.linalg.norm(
+                    transformed - transformed.mean(axis=0),
+                    axis=1,
+                )
 
-        return np_new_feats
+            if self.args["use_feat_rb"]:
+                denominator = max(float(distances.sum()), np.finfo(float).eps)
+                robustness = len(nodes) / denominator
+                community_feature = community_feature * (
+                    0.1 * np.exp(-robustness) + 1.0
+                )
+            updated[community] = community_feature
+
+        return updated.astype("float32", copy=False)
 
     def recalculate_labels_th1(self, labels_communities, np_new_feats):
-        Y = self.graph.ndata['label'].numpy()
-        np_new_labels = np.zeros(len(self.c2n), dtype='int64')
+        labels = self._labels_numpy()
+        features = self._features_numpy()
+        updated = self.new_labels.copy()
 
         for community in labels_communities:
-            nodes = np.array(self.c2n[community])
-            community_features = self.graph.ndata['feat'].numpy()[nodes]
-            distances = np.array([euclidean(np_new_feats[community], node_feat) for node_feat in community_features])
+            nodes = np.asarray(self.c2n[community], dtype=int)
+            distances = np.asarray(
+                [
+                    euclidean(np_new_feats[community], node_feature)
+                    for node_feature in features[nodes]
+                ]
+            )
             threshold = self.calculate_threshold(distances)
             selected_nodes = nodes[distances <= threshold]
+            voting_nodes = selected_nodes if len(selected_nodes) else nodes
+            updated[community] = mode(
+                labels[voting_nodes],
+                keepdims=False,
+            ).mode
+        return updated.astype("int64", copy=False)
 
-            if len(selected_nodes) > 0:
-                np_new_labels[community] = mode(Y[selected_nodes])[0][0]
+    def recalculate_labels_all(self, labels_communities):
+        labels = self._labels_numpy()
+        updated = self.new_labels.copy()
+        for community in labels_communities:
+            nodes = np.asarray(self.c2n[community], dtype=int)
+            updated[community] = mode(labels[nodes], keepdims=False).mode
+        return updated.astype("int64", copy=False)
+
+    def recalculate_labels_kmeans(self, labels_communities):
+        labels = self._labels_numpy()
+        features = self._features_numpy()
+        updated = self.new_labels.copy()
+        for community in labels_communities:
+            nodes = np.asarray(self.c2n[community], dtype=int)
+            if len(nodes) < 2:
+                voting_nodes = nodes
             else:
-                np_new_labels[community] = mode(Y[nodes])[0][0]
-
-        return np_new_labels
+                cluster_labels = KMeans(
+                    n_clusters=2,
+                    random_state=0,
+                    n_init=10,
+                ).fit_predict(features[nodes])
+                largest_cluster = mode(
+                    cluster_labels,
+                    keepdims=False,
+                ).mode
+                voting_nodes = nodes[cluster_labels == largest_cluster]
+            updated[community] = mode(
+                labels[voting_nodes],
+                keepdims=False,
+            ).mode
+        return updated.astype("int64", copy=False)
 
     def calculate_edge_counts(self, n2c, c2n):
-        edge_counts = {}
-        for cu in c2n.keys():
-            for cv in c2n.keys():
-                if cu != cv:
-                    edge_counts[(cu, cv)] = 0
-
-        src, dst = self.graph.edges()
-        for u, v in zip(src.numpy(), dst.numpy()):
-            cu_list = n2c[u] if isinstance(n2c[u], list) else [n2c[u]]
-            cv_list = n2c[v] if isinstance(n2c[v], list) else [n2c[v]]
-            for cu in cu_list:
-                for cv in cv_list:
-                    if cu != cv:
-                        edge_counts[(cu, cv)] += 1
-        return edge_counts
+        del c2n  # The mapping is already represented by n2c.
+        source, target = self.graph.edges()
+        if hasattr(source, "cpu"):
+            source = source.cpu()
+            target = target.cpu()
+        return calculate_edge_counts(source.numpy(), target.numpy(), n2c)
 
     def recalculate_sim_rubost(self, sim_communities_pairs):
-        test_edge_method = self.args['test_edge_method']
-        np_new_sim = {}
+        """Recompute mapped-edge scores after deletion.
 
-        community_set = {c: set(self.c2n[c]) for c in self.c2n}
+        The argument is retained for compatibility.  All scores are rebuilt
+        because a deleted boundary edge changes the degree normalizers in
+        Equation (11), including some neighbor-to-neighbor scores.
+        """
+        del sim_communities_pairs
         edge_counts = self.calculate_edge_counts(self.n2c, self.c2n)
+        if self.args["agg_edge"] == "jaccard":
+            test_edge_method = 3
+            include_jaccard = True
+        elif self.args["agg_edge"] == "rubost":
+            test_edge_method = self.args["test_edge_method"]
+            include_jaccard = True
+        elif self.args["agg_edge"] == "opt":
+            optimizer_model = EdgeWeightOptimizer(
+                num_communities=self.num_communities,
+                initial_edge_counts=edge_counts,
+                new_feats=self.new_feats,
+                args=self.args,
+            )
+            optimizer = torch.optim.Adam(
+                optimizer_model.parameters(),
+                lr=0.01,
+            )
+            for _ in range(1000):
+                optimizer.zero_grad()
+                loss = optimizer_model()
+                loss.backward()
+                optimizer.step()
+            return optimizer_model.calculate_sim()
+        else:
+            raise ValueError("Unknown edge mapping method.")
+        return calculate_robustness_similarity(
+            self.c2n,
+            edge_counts,
+            test_edge_method=test_edge_method,
+            include_jaccard=include_jaccard,
+        )
 
-        for (i, j) in sim_communities_pairs:
-            if i in community_set and j in community_set:
-                edge_count = edge_counts.get((i, j), 0)
-                if edge_count > 0:
-                    out_degree_A = sum(edge_counts.get((i, k), 0) for k in self.c2n if k != i)
-                    in_degree_B = sum(edge_counts.get((k, j), 0) for k in self.c2n if k != j)
+    def calculate_sim2edge_threshold(self):
+        if self.args["th_sim2edge"] < 0 or not self.sim:
+            return 0.0
+        values = np.sort(np.fromiter(self.sim.values(), dtype=float))
+        if len(values) == 1:
+            return float(values[0])
+        gradients = np.diff(values)
+        control = self.args["th_sim2edge"]
+        if control > 0:
+            count = max(1, int(len(values) * control))
+            start = max(0, len(gradients) - count)
+            index = start + int(np.argmax(gradients[start:]))
+        else:
+            index = int(np.argmax(gradients))
+        return float(values[index])
 
-                    if out_degree_A > 0 and in_degree_B > 0:
-                        if test_edge_method == 0:
-                            robustness_A2B = (edge_count / np.sqrt(out_degree_A)) * (edge_count / np.sqrt(in_degree_B))
-                        elif test_edge_method == 1:
-                            robustness_A2B = np.log1p(edge_count) / (np.log1p(out_degree_A) + np.log1p(in_degree_B))
-                        elif test_edge_method == 2:
-                            log_edge = np.log1p(edge_count)
-                            log_out = np.log1p(out_degree_A)
-                            log_in = np.log1p(in_degree_B)
-                            robustness_A2B = (log_edge / np.sqrt(log_out)) * (log_edge / np.sqrt(log_in))
-                        else:
-                            robustness_A2B = 0
-                        np_new_sim[(i, j)] = robustness_A2B
-                        np_new_sim[(j, i)] = robustness_A2B
-                    else:
-                        np_new_sim[(i, j)] = np_new_sim[(j, i)] = 0
+    def gen_nucleus_graph(self):
+        """Build the adjusted mapped graph using the existing DGL interface."""
+        threshold = self.calculate_sim2edge_threshold()
+        edges = [
+            edge
+            for edge, weight in self.sim.items()
+            if weight >= threshold
+        ]
+        source = [edge[0] for edge in edges]
+        target = [edge[1] for edge in edges]
+        nucleus_graph = dgl.graph(
+            (source, target),
+            num_nodes=self.num_communities,
+        )
+        if self.args["use_edge_weight"]:
+            nucleus_graph.edata["weight"] = torch.tensor(
+                [self.sim[edge] for edge in edges],
+                dtype=torch.float32,
+            )
 
-        return np_new_sim
+        nucleus_graph.ndata["feat"] = torch.tensor(
+            self.new_feats,
+            dtype=torch.float32,
+        )
+        nucleus_graph.ndata["label"] = torch.tensor(
+            self.new_labels,
+            dtype=torch.long,
+        )
+        nucleus_graph.ndata["train_mask"] = torch.tensor(
+            self.train_mask,
+            dtype=torch.bool,
+        )
+        nucleus_graph.ndata["val_mask"] = torch.tensor(
+            self.val_mask,
+            dtype=torch.bool,
+        )
+        nucleus_graph.ndata["test_mask"] = torch.tensor(
+            self.test_mask,
+            dtype=torch.bool,
+        )
+
+        zero_degree_nodes = (
+            nucleus_graph.in_degrees() == 0
+        ).nonzero(as_tuple=False).flatten()
+        if len(zero_degree_nodes):
+            nucleus_graph = dgl.remove_nodes(
+                nucleus_graph,
+                zero_degree_nodes,
+            )
+        self.nucleus_graph = nucleus_graph
+        self.data_store.save_nucleus_graph(nucleus_graph)
+        return nucleus_graph
+
+    def retrain_model(self):
+        """Retrain a fresh backbone on the adjusted mapped graph."""
+        graph = self.gen_nucleus_graph()
+        device = torch.device(
+            f'cuda:{self.args["cuda"]}'
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+        graph = graph.to(device)
+        features = graph.ndata["feat"]
+        labels = graph.ndata["label"]
+        train_mask = graph.ndata["train_mask"]
+        val_mask = graph.ndata["val_mask"]
+        test_mask = graph.ndata["test_mask"]
+        if not bool(train_mask.any()):
+            raise ValueError("No mapped training nodes remain after unlearning.")
+
+        num_feats = features.shape[1]
+        num_classes = int(labels.max().item()) + 1
+        model = NodeClassifierDGL(num_feats, num_classes, self.args).to(device)
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=self.args["train_lr"],
+            weight_decay=self.args["train_weight_decay"],
+        )
+
+        best_score = float("-inf")
+        best_model = None
+        for epoch in range(self.args["num_epochs"]):
+            model.train()
+            logits = model(
+                features,
+                graph,
+                graph.edata.get("weight", None),
+            )
+            loss = F.cross_entropy(logits[train_mask], labels[train_mask])
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            score = self._mask_f1(model, graph, features, labels, val_mask)
+            selection_score = score if not np.isnan(score) else -float(loss.item())
+            if selection_score > best_score:
+                best_score = selection_score
+                best_model = copy.deepcopy(model.state_dict())
+            self.logger.info(
+                "Unlearning retrain epoch %d, loss %.6f, val macro-F1 %.6f",
+                epoch,
+                loss.item(),
+                score,
+            )
+
+        if best_model is not None:
+            model.load_state_dict(best_model)
+        self.model = model
+        self.nucleus_graph = graph
+
+        test_f1 = self._mask_f1(model, graph, features, labels, test_mask)
+        test_acc = self._mask_accuracy(
+            model,
+            graph,
+            features,
+            labels,
+            test_mask,
+        )
+        self.logger.info(
+            "Updated mapped graph test macro-F1 %.6f, accuracy %.6f",
+            test_f1,
+            test_acc,
+        )
+
+        model_path = self.data_store.target_model_file + "_unlearned.pt"
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "num_feats": num_feats,
+                "num_classes": num_classes,
+                "target_model": self.args["target_model"],
+                "unlearning_nodes": list(self.unlearning_set),
+            },
+            model_path,
+        )
+        self.logger.info("Updated model saved to %s", model_path)
+        return model
+
+    @staticmethod
+    def _mask_f1(model, graph, features, labels, mask):
+        if not bool(mask.any()):
+            return float("nan")
+        model.eval()
+        with torch.no_grad():
+            logits = model(features, graph, graph.edata.get("weight", None))
+            prediction = logits[mask].argmax(dim=1)
+        return f1_score(
+            labels[mask].cpu(),
+            prediction.cpu(),
+            average="macro",
+        )
+
+    @staticmethod
+    def _mask_accuracy(model, graph, features, labels, mask):
+        if not bool(mask.any()):
+            return float("nan")
+        model.eval()
+        with torch.no_grad():
+            logits = model(features, graph, graph.edata.get("weight", None))
+            prediction = logits[mask].argmax(dim=1)
+        return accuracy_score(labels[mask].cpu(), prediction.cpu())
