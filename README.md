@@ -150,7 +150,7 @@ dataset. Tests requiring torch or DGL are skipped when those packages are absent
 ## Contact
 
 For questions about the paper or implementation, contact Yi Li at
-[yi.li04@adelaide.edu.au](mailto:yi.li04@adelaide.edu.au) (preferred).
+[yi.li04@adelaide.edu.au](mailto:yi.li04@adelaide.edu.au) (preferred) or liiyi.xsjl@gmail.com.
 
 ## Validation note
 
