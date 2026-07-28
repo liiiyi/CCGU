@@ -2,7 +2,6 @@ import logging
 
 import dgl
 import networkx as nx
-from cdlib import algorithms
 import time
 from infomap import Infomap as Ifp
 
@@ -35,8 +34,13 @@ class Infomap:
 
 
     def run_infomap(self, graph):
-        infomap_args = f"--two-level --directed --num-trials {self.trials} --markov-time {self.markov_time} --seed {self.seed} --silent"
-        infomap = Ifp("--two-level --directed --num-trials 100 --seed 42 --silent")
+        # The constructed argument string used to be discarded in favour of a
+        # hard-coded one, so --random_seed, --markov-time and the trial count had
+        # no effect and every run reused seed 42.
+        infomap_args = f"--two-level --directed --num-trials {self.trials} --markov-time {self.markov_time} --seed {self.seed}"
+        if self.silent:
+            infomap_args += " --silent"
+        infomap = Ifp(infomap_args)
 
         # Add edges to Infomap
         if isinstance(graph, nx.Graph):

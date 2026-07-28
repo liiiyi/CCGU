@@ -1,3 +1,4 @@
+import copy
 import time
 
 import torch
@@ -7,14 +8,17 @@ import networkx as nx
 import numpy as np
 import logging
 import dgl
-import tensorflow as tf
 from sklearn.model_selection import train_test_split
-from lib_gnn_model.node_classifier import NodeClassifier
 from lib_gnn_model.node_classifier_dgl import NodeClassifierDGL
 from sklearn.metrics import f1_score, accuracy_score
 import torch.nn.functional as F
 import os
 import random
+
+# TensorFlow used to be imported here for three tensor ops (cast/gather/reduce_sum)
+# in calculate_tvt_split_nucleus.  It has been replaced with the equivalent numpy,
+# because tensorflow==2.13.1 requires numpy<=1.24.3 while requirements.txt pins
+# numpy==1.24.4, so the two pins could never be installed together.
 
 
 class TrainModel(Exp):
@@ -25,8 +29,6 @@ class TrainModel(Exp):
         self.load_data()
 
         num_nodes_original = self.graph.number_of_nodes()
-        # self.test_mask_original = self.graph.ndata['test_mask']
-        # labels_original = self.graph.ndata['label']
 
         regen_graph = False
         if os.path.exists(self.data_store.nugraph_file) and not regen_graph:
@@ -39,7 +41,7 @@ class TrainModel(Exp):
             self.data_store.save_nucleus_graph(self.nucleus_graph)
 
         self.deter_model()
-        self.train_model()
+        val_f1, val_acc, test_f1, test_acc = self.train_model()
 
         config_str = (
             f"\n"
@@ -58,6 +60,25 @@ class TrainModel(Exp):
         self.logger.info(f'Time Consumption of Generating nucleus graph: {time_gen_graph} seconds')
         self.logger.info(f'Training time: {self.train_time} seconds')
 
+        self.write_metrics({
+            'stage': 'train',
+            'num_nodes_original': int(num_nodes_original),
+            'num_communities': int(self.num_communities),
+            'mapped_graph_nodes': int(self.graph.number_of_nodes()),
+            'mapped_graph_edges': int(self.graph.number_of_edges()),
+            'train_nodes': int(self.train_mask.sum().item()),
+            'val_nodes': int(self.val_mask.sum().item()),
+            'test_nodes': int(self.test_mask.sum().item()),
+            'num_classes': int(self.num_classes),
+            'val_macro_f1': val_f1,
+            'val_accuracy': val_acc,
+            'test_macro_f1': test_f1,
+            'test_accuracy': test_acc,
+            'gen_nucleus_graph_seconds': time_gen_graph,
+            'train_seconds': self.train_time,
+            'model_path': getattr(self, 'model_path', None),
+        })
+
     def load_data(self):
         self.logger.info('loading dataset')
         if self.args['dgl_data']:
@@ -72,10 +93,37 @@ class TrainModel(Exp):
         load_nucleus_data = self.data_store.load_nucleus_data(if_sim=0)
         self.new_feats = load_nucleus_data['new_feats']
         self.new_labels = load_nucleus_data['new_labels']
-        # self.train_mask = load_nucleus_data['train_mask']
-        self.val_mask = load_nucleus_data['val_mask']
-        self.test_mask_original = load_nucleus_data['test_mask']
+
+        # Original-graph test mask, indexed by ORIGINAL node id.  This is what
+        # calculate_tvt_split_nucleus needs: it asks "is this singleton community's
+        # one original node a held-out node?".  Reading the community-indexed mask
+        # from the mapping stage instead (as this line used to) indexes a length
+        # num_communities array with original node ids, which is either an
+        # out-of-range gather or, worse, a silently wrong answer.
+        self.test_mask_original = self._original_test_mask()
         self.sim = self.data_store.load_nucleus_data(if_sim=1)
+
+    def _original_test_mask(self):
+        """Held-out mask over ORIGINAL nodes, generated deterministically if absent."""
+        node_data = getattr(self.graph, 'ndata', {})
+        if 'test_mask' in node_data:
+            return node_data['test_mask'].cpu().numpy().astype(bool)
+
+        # Coauthor-CS and friends ship no split, so derive one from the seed.
+        self.logger.info(
+            'dataset %s has no test_mask; deriving a deterministic original-node '
+            'split with test_ratio %.3f and seed %d',
+            self.args['dataset_name'], self.args['test_ratio'], self.args['random_seed'],
+        )
+        indices = np.arange(self.num_nodes)
+        _, held_out = train_test_split(
+            indices,
+            test_size=self.args['test_ratio'],
+            random_state=self.args['random_seed'],
+        )
+        mask = np.zeros(self.num_nodes, dtype=bool)
+        mask[held_out] = True
+        return mask
 
     def gen_nucleus_graph(self, c2n):
         # calculate th automatically
@@ -105,10 +153,25 @@ class TrainModel(Exp):
 
         # 设置节点特征和标签
         nucleus_graph.ndata['feat'] = torch.tensor(self.new_feats, dtype=torch.float32).to(device)
-        nucleus_graph.ndata['label'] = torch.tensor(self.new_labels, dtype=torch.float32).to(device)
+        # Labels index a cross-entropy target, so keep them integral; storing them
+        # as float32 forced a .long() cast at every use and silently rounded.
+        nucleus_graph.ndata['label'] = torch.tensor(self.new_labels, dtype=torch.long).to(device)
 
         # 计算训练、验证和测试集的掩码
         train_mask, val_mask, test_mask = self.calculate_tvt_split_nucleus(c2n)
+        # Persist the split in COMMUNITY-ID space (before zero-degree nodes are
+        # dropped below) so that Unlearn retrains and evaluates on exactly the
+        # split this deployment used.  Without this, Unlearn fell back to the
+        # mapping stage's own random masks and the before/after F1 numbers were
+        # measured on different test sets.
+        self.data_store.save_nucleus_masks({
+            'train_mask': np.asarray(train_mask, dtype=bool),
+            'val_mask': np.asarray(val_mask, dtype=bool),
+            'test_mask': np.asarray(test_mask, dtype=bool),
+            'num_communities': int(self.num_communities),
+            'test_ratio': self.args['test_ratio'],
+            'random_seed': self.args['random_seed'],
+        })
         nucleus_graph.ndata['train_mask'] = torch.tensor(train_mask, dtype=torch.bool).to(device)
         nucleus_graph.ndata['val_mask'] = torch.tensor(val_mask, dtype=torch.bool).to(device)
         nucleus_graph.ndata['test_mask'] = torch.tensor(test_mask, dtype=torch.bool).to(device)
@@ -121,8 +184,9 @@ class TrainModel(Exp):
         self.logger.info(nucleus_graph)
 
     def gen_masks(self, X, n_data, test_size):
-        train, other, _, _ = train_test_split(X, X, test_size=test_size)
-        val, test, _, _ = train_test_split(other, other, test_size=0.5)
+        seed = self.args['random_seed']
+        train, other, _, _ = train_test_split(X, X, test_size=test_size, random_state=seed)
+        val, test, _, _ = train_test_split(other, other, test_size=0.5, random_state=seed)
         train_mask = np.array([False] * n_data)
         val_mask = np.array([False] * n_data)
         test_mask = np.array([False] * n_data)
@@ -140,10 +204,12 @@ class TrainModel(Exp):
         test_size = self.args['test_ratio']
         # Applicable only to graph partitioning methods without isolation
         self.logger.info('calculating train/val/test mask')
-        test_communities = [community for community in c2n if
-                            len(c2n[community]) == 1 and tf.reduce_sum(
-                                tf.gather(tf.cast(self.test_mask_original, dtype=tf.float32),
-                                          c2n[community])).numpy().item() > 0.5]
+        original_test_mask = np.asarray(self.test_mask_original, dtype=bool)
+        test_communities = [
+            community for community in c2n
+            if len(c2n[community]) == 1
+            and bool(original_test_mask[np.asarray(c2n[community], dtype=int)].any())
+        ]
         train_communities = [community for community in c2n if len(c2n[community]) > 1]
         available_communities = list(set(range(self.num_communities)).difference(set(test_communities)))
         self.logger.info(
@@ -198,7 +264,12 @@ class TrainModel(Exp):
         self.device = torch.device(f'cuda:{self.args["cuda"]}' if torch.cuda.is_available() else 'cpu')
 
         self.num_feats = self.nucleus_graph.ndata['feat'].shape[1]
-        self.num_classes = len(torch.unique(self.nucleus_graph.ndata['label']))
+        # Size the output head from the ORIGINAL label space, not from the labels
+        # that survive in the mapped graph.  len(unique(...)) undercounts whenever a
+        # class does not reach a mapped node, which makes cross_entropy raise
+        # "Target N is out of bounds"; it also has to match the head that Unlearn
+        # rebuilds, otherwise before/after numbers are not comparable.
+        self.num_classes = self.num_original_classes()
 
         self.model = NodeClassifierDGL(self.num_feats, self.num_classes, self.args)
 
@@ -210,10 +281,17 @@ class TrainModel(Exp):
         self.val_mask = self.graph.ndata['val_mask'].to(self.device)
         self.test_mask = self.graph.ndata['test_mask'].to(self.device)
 
+    def num_original_classes(self):
+        """Number of classes in the original dataset."""
+        labels = self.graph.ndata['label'] if 'label' in self.graph.ndata else None
+        if labels is None:
+            return int(np.asarray(self.new_labels).max()) + 1
+        return int(labels.max().item()) + 1
+
     def train_model(self):
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args['train_lr'],
                                      weight_decay=self.args['train_weight_decay'])
-        best_score = 0
+        best_score = -float('inf')
         best_model = None
         start_time = time.time()
 
@@ -228,16 +306,30 @@ class TrainModel(Exp):
             val_score, test_score = self._evaluate_model()
             self.logger.info(f'Epoch {epoch}, Loss: {loss.item()}, Val F1: {val_score}, Test F1: {test_score}')
 
-            if test_score > best_score:
-                best_score = test_score
-                best_model = self.model.state_dict()
+            # Select on validation, never on test.  Keeping the checkpoint with the
+            # best *test* F1 reports the maximum over 200 epochs of test scores,
+            # which is not a held-out number.
+            selection_score = val_score if not np.isnan(val_score) else -float(loss.item())
+            if selection_score > best_score:
+                best_score = selection_score
+                best_model = copy.deepcopy(self.model.state_dict())
 
         self.train_time = time.time() - start_time
 
-        if best_model:
+        if best_model is not None:
             self.model.load_state_dict(best_model)
-            # self.data_store.save_model(self.model)
-            self.logger.info('Best model saved.')
+            self.model_path = self.data_store.target_model_file + '_deployed.pt'
+            torch.save(
+                {
+                    'model_state_dict': self.model.state_dict(),
+                    'num_feats': self.num_feats,
+                    'num_classes': self.num_classes,
+                    'target_model': self.args['target_model'],
+                    'random_seed': self.args['random_seed'],
+                },
+                self.model_path,
+            )
+            self.logger.info('Best model saved to %s', self.model_path)
 
         final_val_f1, final_val_acc, final_test_f1, final_test_acc = self._evaluate_model(final=True)
         self.logger.info(f'Final Validation F1: {final_val_f1}, Final Validation Acc: {final_val_acc}')
@@ -249,20 +341,22 @@ class TrainModel(Exp):
         self.model.eval()
         with torch.no_grad():
             logits = self.model(self.features, self.graph, self.graph.edata.get('weight', None))
-            val_logits = logits[self.val_mask]
-            test_logits = logits[self.test_mask]
-
-            val_pred = val_logits.max(1)[1]
-            test_pred = test_logits.max(1)[1]
-
-            val_f1 = f1_score(self.labels[self.val_mask].cpu(), val_pred.cpu(), average='macro')
-            test_f1 = f1_score(self.labels[self.test_mask].cpu(), test_pred.cpu(), average='macro')
-
-            val_acc = accuracy_score(self.labels[self.val_mask].cpu(), val_pred.cpu())
-            test_acc = accuracy_score(self.labels[self.test_mask].cpu(), test_pred.cpu())
+            val_f1, val_acc = self._masked_scores(logits, self.val_mask)
+            test_f1, test_acc = self._masked_scores(logits, self.test_mask)
 
             if not final:
                 self.logger.info(f'Validation F1: {val_f1}, Validation Acc: {val_acc}')
                 self.logger.info(f'Test F1: {test_f1}, Test Acc: {test_acc}')
 
         return (val_f1, val_acc, test_f1, test_acc) if final else (val_f1, test_f1)
+
+    def _masked_scores(self, logits, mask):
+        """Macro F1 and accuracy on ``mask``, or NaN when the mask is empty."""
+        if not bool(mask.any()):
+            return float('nan'), float('nan')
+        prediction = logits[mask].argmax(dim=1)
+        target = self.labels[mask].cpu()
+        return (
+            f1_score(target, prediction.cpu(), average='macro', zero_division=0),
+            accuracy_score(target, prediction.cpu()),
+        )

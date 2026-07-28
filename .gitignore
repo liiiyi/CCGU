@@ -1,5 +1,25 @@
 __pycache__/
 *.py[cod]
+*.so
 .DS_Store
+
+# interpreter prefixes and virtual environments
 .venv/
+.conda-env/
+
+# datasets downloaded through DGL, and every artifact the pipeline generates
 temp_data/
+
+# locally generated experiment output: artifact trees, logs and collected results
+reproduction/runs/
+reproduction/logs/
+reproduction/results/
+
+# model weights and pickled artifacts are never versioned
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.pickle
+*.npy
+*.npz

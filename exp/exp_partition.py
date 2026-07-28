@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 import os.path
@@ -8,11 +9,9 @@ import networkx as nx
 from exp.exp import Exp
 from exp.methods.SLPA import SLPA
 from exp.methods.OSLOM import OSLOM
-from exp.methods.NIKM import NIKM
 from sklearn.decomposition import PCA
 from scipy.spatial.distance import euclidean
 import numpy as np
-from scipy.stats import mode
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from collections import defaultdict
@@ -21,12 +20,24 @@ import config
 import time
 import torch
 from sklearn.cluster import KMeans
-from exp.methods.GetEmbed import GetEmbed as ge
-from exp.methods.Louvain import Louvain
 from exp.methods.WeightOptimizer import EdgeWeightOptimizer
+from exp.methods.CCP import CommunityCentricPartition
+from exp.unlearning_core import (
+    calculate_edge_counts as core_calculate_edge_counts,
+    calculate_robustness_similarity,
+)
+from exp.methods.partition_diagnostics import (
+    check_partition_health,
+    format_summary,
+    summarise_partition,
+)
+from lib_utils.stats import majority_label
 import torch.optim as optim
-from exp.methods.CCD import CentroidCommunityDetection as CCD
-from exp.methods.Infomap import Infomap
+
+# The optional community-detection backends (hnswlib for CCD/NIKM, infomap for
+# Infomap, cdlib for the legacy Louvain wrapper) are imported inside
+# gen_community().  Importing them at module scope used to make `--exp Partition`
+# impossible for *every* partition method whenever one optional wheel was absent.
 
 class GraphCommunityPartition(Exp):
     def __init__(self, args):
@@ -58,7 +69,22 @@ class GraphCommunityPartition(Exp):
         self.logger.info(config_str)
 
         self.logger.info(f'Time Consumption of Partition: {self.time_partition}')
-        self.logger.info(f'Time Consumption of Calculation: {calculate_time}')
+        self.logger.info(
+            f'Time Consumption of Calculation (mapping only, detection excluded): '
+            f'{calculate_time}')
+
+        metrics = {
+            'stage': 'partition',
+            'partition_seconds': self.time_partition,
+            'mapping_seconds': calculate_time,
+            'partition_diagnostics': getattr(self, 'partition_summary', None),
+            'partition_attempts': getattr(self, 'partition_attempts', None),
+            'num_mapped_edges_scored': getattr(self, 'num_sim_pairs', None),
+            'partition_scale_report': getattr(self, 'partition_scale_report', None),
+            'detector_backend': getattr(self, 'detector_backend', None),
+        }
+        metrics.update(getattr(self, 'stage_times', {}))
+        self.write_metrics(metrics)
 
     def load_data(self):
         if self.args['dgl_data']:
@@ -76,33 +102,185 @@ class GraphCommunityPartition(Exp):
         self.graph.add_nodes_from(nodes)
         self.graph.add_edges_from(edges)
 
+    #: Partition methods whose implementation is a label-propagation variant.  The
+    #: one historically named 'oslom' contains no Louvain stage and is not OSLOM;
+    #: see exp/methods/README.md.
+    LEGACY_LABEL_PROPAGATION = ('oslom', 'slpa')
+
+    def _run_partition(self, seed):
+        """Dispatch to the requested community-detection backend.
+
+        Returns ``(n2c, c2n, num_communities, elapsed_seconds)``.  Optional
+        third-party backends are imported here so that a missing wheel only
+        affects the method that needs it.
+        """
+        method = self.args['partition']
+        args = dict(self.args)
+        args['random_seed'] = seed
+
+        if method == 'ccp':
+            detector = CommunityCentricPartition(self.graph, args=args)
+            result = detector.partition()
+            self.partition_scale_report = getattr(detector, 'scale_report', None)
+            self.detector_backend = 'networkx-louvain (CPU)'
+            return result
+
+        if method == 'gae':
+            from exp.methods.GAEPartition import GAEPartition
+
+            detector = GAEPartition(self.graph, args=args)
+            result = detector.partition()
+            self.partition_scale_report = getattr(detector, 'scale_report', None)
+            self.detector_backend = 'dgl-gae ({})'.format(
+                (getattr(detector, 'gae_report', {}) or {}).get('device', 'unknown')
+            )
+            return result
+
+        if method == 'slpa':
+            slpa = SLPA(self.graph, max_iterations=50, threshold=0.2, max_communities_per_node=5)
+            return slpa.SLPA_partition()
+
+        if method == 'oslom':
+            oslom = OSLOM(self.graph, args=args)
+            return oslom.OSLOM_partition()
+
+        if method == 'lpa':
+            from exp.methods.LPA import LPA
+
+            return LPA(self.graph, args=args).lpa_partition()
+
+        if method == 'louvain':
+            from exp.methods.Louvain import Louvain
+
+            return Louvain(self.graph, args=args).louvain_partition()
+
+        if method == 'infomap':
+            try:
+                from exp.methods.Infomap import Infomap
+            except ImportError as error:  # pragma: no cover - optional backend
+                raise ImportError(
+                    "--partition infomap needs the 'infomap' package "
+                    "(pip install infomap==2.7.1)"
+                ) from error
+            return Infomap(self.graph, args=args, seed=seed).partition()
+
+        if method == 'nikm':
+            try:
+                from exp.methods.GetEmbed import GetEmbed
+                from exp.methods.NIKM import NIKM
+            except ImportError as error:  # pragma: no cover - optional backend
+                raise ImportError(
+                    "--partition nikm needs its embedding backend; "
+                    "see reproduction/requirements-lock.txt"
+                ) from error
+            embeddings = GetEmbed(self.graph, args).generate_embeddings()
+            return NIKM(self.graph, embeddings=embeddings, args=args).run()
+
+        if method == 'test':
+            try:
+                from exp.methods.CCD import CentroidCommunityDetection as CCD
+            except ImportError as error:  # pragma: no cover - optional backend
+                raise ImportError(
+                    "--partition test needs hnswlib (pip install hnswlib==0.8.0)"
+                ) from error
+            n2c, c2n, elapsed = CCD(self.graph, args=args).run()
+            return n2c, c2n, len(c2n), elapsed
+
+        raise ValueError(
+            "unknown --partition {!r}; choose one of "
+            "ccp, gae, slpa, oslom, nikm, lpa, louvain, test, infomap".format(method)
+        )
+
+    def _diagnose(self, c2n, elapsed_seconds):
+        """Summarise partition quality and log it."""
+        labels = None
+        edges = None
+        if hasattr(self.graph, 'ndata') and 'label' in getattr(self.graph, 'ndata', {}):
+            labels = self.graph.ndata['label'].cpu().numpy()
+        if hasattr(self.graph, 'edges') and hasattr(self.graph, 'num_nodes'):
+            src, dst = self.graph.edges()
+            edges = (src.cpu().numpy(), dst.cpu().numpy())
+        summary = summarise_partition(
+            c2n,
+            num_nodes=self.num_nodes,
+            labels=labels,
+            edges=edges,
+            elapsed_seconds=elapsed_seconds if isinstance(elapsed_seconds, float) else None,
+        )
+        summary['dataset'] = self.args['dataset_name']
+        summary['method'] = self.args['partition']
+        summary['seed'] = self.args['random_seed']
+        self.logger.info('\n%s', format_summary(summary))
+        return summary
+
     def gen_community(self):
-        #TODO: if exsit, load
         if os.path.exists(self.data_store.community_file):
-            self.logger.info("Community file exists. Loading the file.")
+            # The cache key does not include --random_seed, so reusing it means the
+            # seed on this command line had no influence on the partition.  Say so
+            # loudly: a silently reused partition is the easiest way to mistake one
+            # seed's community structure for another's.
+            self.logger.warning(
+                "reusing the existing community file %s; --random_seed %s did NOT "
+                "affect this partition.  Delete the file (or point CCGU_DATA_ROOT at "
+                "a fresh directory) to re-detect communities.",
+                self.data_store.community_file, self.args['random_seed'],
+            )
             com_data = self.data_store.load_communities_info()
             n2c = com_data['n2c']
             c2n = com_data['c2n']
             num_communities = com_data['num_c']
 
             self.time_partition = 'Partition File is already exist.'
+            self.partition_summary = self._diagnose(c2n, None)
         else:
-            if self.args['partition'] == 'slpa':
-                slpa = SLPA(self.graph, max_iterations=50, threshold=0.2, max_communities_per_node=5)
-                n2c, c2n, num_communities, self.time_partition = slpa.SLPA_partition()
-            elif self.args['partition'] == 'oslom':
-                oslom = OSLOM(self.graph, args=self.args)
-                n2c, c2n, num_communities, self.time_partition = oslom.OSLOM_partition()
-            elif self.args['partition'] == 'infomap':
-                infomap = Infomap(self.graph, args=self.args)
-                n2c, c2n, num_communities, self.time_partition = infomap.partition()
-            elif self.args['partition'] == 'test':
-                ccd = CCD(self.graph, args=self.args)
-                n2c, c2n, self.time_partition = ccd.run()
-                num_communities = len(c2n)
-            else:
-                self.logger.info("Error Method Name.")
-                return 1
+            if self.args['partition'] in self.LEGACY_LABEL_PROPAGATION:
+                self.logger.warning(
+                    "--partition %s selects the legacy label-propagation implementation. "
+                    "It is kept verbatim for comparability, but it is not OSLOM, it has no "
+                    "Louvain initialisation stage, and it produces an almost disjoint "
+                    "partition.  Use --partition ccp for the paper-described coarse-to-fine "
+                    "process; see exp/methods/README.md.",
+                    self.args['partition'],
+                )
+
+            attempts = []
+            base_seed = self.args['random_seed']
+            max_attempts = 1 + max(0, self.args['partition_max_retries'])
+            result = None
+            for attempt in range(max_attempts):
+                seed = base_seed + attempt
+                self.logger.info(
+                    'partition attempt %d/%d with seed %d (method %s)',
+                    attempt + 1, max_attempts, seed, self.args['partition'],
+                )
+                n2c, c2n, num_communities, self.time_partition = self._run_partition(seed)
+                summary = self._diagnose(c2n, self.time_partition)
+                summary['attempt'] = attempt + 1
+                summary['attempt_seed'] = seed
+                problems = check_partition_health(
+                    summary, min_communities=self.args['partition_min_communities']
+                )
+                summary['quality_gate_problems'] = problems
+                attempts.append(summary)
+                if not problems:
+                    result = (n2c, c2n, num_communities, summary)
+                    break
+                self.logger.warning(
+                    'partition attempt %d failed the quality gate: %s',
+                    attempt + 1, '; '.join(problems),
+                )
+
+            # Every attempt is recorded, so a retry can never quietly hide a bad
+            # draw, and the gate never looks at downstream model quality.
+            self.partition_attempts = attempts
+            if result is None:
+                raise RuntimeError(
+                    "every partition attempt failed the quality gate ({} attempt(s)); "
+                    "last reasons: {}".format(
+                        len(attempts), '; '.join(attempts[-1]['quality_gate_problems'])
+                    )
+                )
+            n2c, c2n, num_communities, self.partition_summary = result
 
             com_data = {
                 'n2c': n2c,
@@ -110,10 +288,34 @@ class GraphCommunityPartition(Exp):
                 'num_c': num_communities
             }
             self.data_store.save_communities_info(params=com_data)
+            self._save_partition_report(attempts)
 
         self._check_communities(c2n)
 
         return n2c, c2n, num_communities
+
+    def _save_partition_report(self, attempts):
+        report_path = self.data_store.community_file + '_diagnostics.json'
+        payload = {
+            'dataset': self.args['dataset_name'],
+            'method': self.args['partition'],
+            'random_seed': self.args['random_seed'],
+            'partition_max_retries': self.args['partition_max_retries'],
+            'partition_min_communities': self.args['partition_min_communities'],
+            'attempts': attempts,
+            'accepted_attempt': attempts[-1]['attempt'] if attempts else None,
+        }
+        if self.args['partition'] in ('ccp', 'gae'):
+            payload['ccp_config'] = {
+                key: self.args[key]
+                for key in sorted(self.args)
+                if key.startswith('ccp_') or key.startswith('gae_')
+            }
+            payload['scale_report'] = getattr(self, 'partition_scale_report', None)
+            payload['detector_backend'] = getattr(self, 'detector_backend', None)
+        with open(report_path, 'w') as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, default=str)
+        self.logger.info('partition diagnostics written to %s', report_path)
 
     def _check_communities(self, c2n):
         # Initialize a dictionary to count the occurrences of each node in communities
@@ -142,11 +344,20 @@ class GraphCommunityPartition(Exp):
             self.logger.info(f"Number of nodes overlapping {i} time(s): {overlap_counts[i]}")
 
     def aggregate(self):
+        """Build the mapped features, labels, masks and edges.
 
-        start_time = time.time()
-
+        Returns the mapping wall clock **excluding** community detection, which is
+        reported separately as ``self.time_partition``.  Timing them together would
+        make a detector comparison meaningless, because Equation (11) over every
+        observed community pair can cost more than the detector itself on a graph
+        with many communities.
+        """
         n2c, c2n, num_communities = self.gen_community()
 
+        # Mapping clock starts here, after detection.
+        start_time = time.time()
+        self.stage_times = {}
+        stage_start = time.time()
         if self.aggregate_feat_info == 'pca':
             new_feats = self.aggregate_features_pca(c2n)
         elif self.aggregate_feat_info == 'mean':
@@ -154,7 +365,9 @@ class GraphCommunityPartition(Exp):
         else:
             self.logger.info("Error param")
             return 1
+        self.stage_times['feature_mapping_seconds'] = time.time() - stage_start
 
+        stage_start = time.time()
         if self.aggregate_label_info == 'th':
             new_labels, selected_nodes = self.aggregate_labels_th1(c2n, np_new_feats=new_feats)
             set_file = config.COM_PATH + self.args['dataset_name'] + "/" + self.args['partition'] + '_select_n'
@@ -166,7 +379,9 @@ class GraphCommunityPartition(Exp):
         else:
             self.logger.info("Error param")
             return 1
+        self.stage_times['label_mapping_seconds'] = time.time() - stage_start
 
+        stage_start = time.time()
         train_mask, val_mask, test_mask = self.generate_masks(num=num_communities, test_size=self.args['test_ratio'])
 
         # save
@@ -179,8 +394,9 @@ class GraphCommunityPartition(Exp):
         }
 
         self.data_store.save_nucleus_data(params=nucleus_data, if_sim=0)
+        self.stage_times['mask_and_save_seconds'] = time.time() - stage_start
 
-
+        stage_start = time.time()
         if self.aggregate_e_info == 'jaccard':
             sim = self.calculate_sim(n2c, c2n)
         elif self.aggregate_e_info == 'rubost':
@@ -190,7 +406,9 @@ class GraphCommunityPartition(Exp):
         else:
             self.logger.info("Error param")
             return 1
+        self.stage_times['edge_mapping_seconds'] = time.time() - stage_start
         self.logger.info(f'{len(sim)} pairs are found.')
+        self.num_sim_pairs = len(sim)
 
         # sim = self.instrument.smooth_edge_weights(sim, threshold_weight=0.5)
 
@@ -204,9 +422,10 @@ class GraphCommunityPartition(Exp):
         Param
         num: number of communities
         """
+        seed = self.args['random_seed']
         X = np.array(range(num))
-        train, other, _, _ = train_test_split(X, X, test_size=test_size)
-        val, test, _, _ = train_test_split(X[other], X[other], test_size=0.5)
+        train, other, _, _ = train_test_split(X, X, test_size=test_size, random_state=seed)
+        val, test, _, _ = train_test_split(X[other], X[other], test_size=0.5, random_state=seed)
         train_mask = np.array([False] * num)
         val_mask = np.array([False] * num)
         test_mask = np.array([False] * num)
@@ -255,7 +474,14 @@ class GraphCommunityPartition(Exp):
 
                 distances = np.linalg.norm(transformed_feats - community_feature, axis=1)
 
-            feature_robustness[community] = len(nodes) / distances.sum()
+            # A singleton community, or one whose members share identical features,
+            # has distances summing to exactly 0.  Dividing by it yields `inf` plus a
+            # numpy RuntimeWarning for every such community -- and the hold-out
+            # protocol deliberately creates thousands of singletons.  Clamp the
+            # denominator, matching Unlearn.recalculate_features_pca, so the stored
+            # value is finite whether or not --use_feat_rb is set.
+            denominator = max(float(distances.sum()), np.finfo(np.float64).eps)
+            feature_robustness[community] = len(nodes) / denominator
 
         # instru = Instruments
         # smoothed_robustness = instru.smooth_edge_weights(feature_robustness, threshold_weight=0.5)
@@ -270,19 +496,22 @@ class GraphCommunityPartition(Exp):
         return np_new_feats
 
     def calculate_threshold(self, distances):
+        """Equation (8): tau = d_{argmax g} with g_i = d_{i+1} - d_i on sorted d.
+
+        The consecutive difference is what Equation (8) defines, and it is what
+        ``exp/exp_unlearn.py`` recomputes for the communities a deletion touches.
+        Using ``np.gradient`` here instead (a centred difference, which also
+        shifts the arg-max) made Partition and Unlearn disagree, so an unlearning
+        request silently relabelled communities it had not modified.
+        """
         if len(distances) <= 1:
             return np.inf
-        # Sort distances
         sorted_distances = np.sort(distances)
-        # Compute gradient
-        gradients = np.gradient(sorted_distances)
-        # Optional: Plot gradients
+        gradients = np.diff(sorted_distances)
 
-        # self.plot_gradients(sorted_distances, gradients)
+        # Optional: self.plot_gradients(sorted_distances, gradients)
 
-        # Find the index with the maximum gradient
-        max_gradient_idx = np.argmax(gradients)
-        # Use the distance at this index as the threshold
+        max_gradient_idx = int(np.argmax(gradients))
         threshold = sorted_distances[max_gradient_idx]
         return threshold
 
@@ -296,42 +525,51 @@ class GraphCommunityPartition(Exp):
         plt.title('Distance and Gradient Plot')
         plt.show()
 
-    '''
-
     def aggregate_labels_th1(self, c2n, np_new_feats):
-        Y = self.graph.ndata['label'].numpy()
-        X = self.graph.ndata['feat'].numpy()
+        """Equations (7)-(9): distance to the mapped feature, elbow cut, majority vote.
+
+        This method was the body of a triple-quoted block, so ``--agg_label th``
+        -- the default, and the setting that implements Equation (9) -- raised
+        ``AttributeError: 'GraphCommunityPartition' object has no attribute
+        'aggregate_labels_th1'`` before any mapping happened.  It is restored
+        verbatim except that the SciPy mode call goes through
+        ``lib_utils.stats.majority_label`` so it behaves the same on every
+        supported SciPy, and it mirrors ``Unlearn.recalculate_labels_th1``.
+
+        Returns the mapped labels and the set of original nodes that actually
+        voted; ``exp/exp_unlearn.py`` reads that set back from disk.
+        """
+        Y = self.graph.ndata['label'].cpu().numpy()
+        X = self.graph.ndata['feat'].cpu().numpy()
         np_new_labels = np.zeros(len(c2n), dtype='int64')
 
         # Set to store all selected nodes across iterations
         selected_nodes_set = set()
 
         for community, nodes in tqdm(c2n.items(), desc="Aggregating Labels by th"):
-            nodes = np.array(nodes)
+            nodes = np.asarray(nodes, dtype=int)
             community_features = X[nodes]
             distances = np.array([euclidean(np_new_feats[community], node_feat) for node_feat in community_features])
 
-            # Calculate the threshold automatically
+            # Calculate the threshold automatically (Equation 8)
             threshold = self.calculate_threshold(distances)
 
             # Select nodes with distance less than the threshold
             selected_nodes = nodes[distances <= threshold]
 
             # Add selected nodes to the set
-            selected_nodes_set.update(selected_nodes)
+            selected_nodes_set.update(int(node) for node in selected_nodes)
 
             if len(selected_nodes) > 0:
-                np_new_labels[community] = mode(Y[selected_nodes])[0][0]
+                np_new_labels[community] = majority_label(Y[selected_nodes])
             else:
                 # If no nodes are selected, use the original majority vote for robustness
-                np_new_labels[community] = mode(Y[nodes])[0][0]
+                np_new_labels[community] = majority_label(Y[nodes])
 
         self.logger.info('New shapes for label are generated by major.')
 
         # Return both the new labels and the set of all selected nodes
         return np_new_labels, selected_nodes_set
-
-        '''
 
     def aggregate_labels_kmeans(self, c2n, np_new_feats):
         """
@@ -353,13 +591,13 @@ class GraphCommunityPartition(Exp):
             community_features = X[nodes]
             kmeans = KMeans(n_clusters=2, random_state=0).fit(community_features)
             labels = kmeans.labels_
-            largest_cluster_label = mode(labels)[0][0]
+            largest_cluster_label = majority_label(labels)
             largest_cluster_indices = [node for node, label in zip(nodes, labels) if label == largest_cluster_label]
 
             if len(largest_cluster_indices) > 0:
-                np_new_labels[community] = mode(Y[largest_cluster_indices])[0][0]
+                np_new_labels[community] = majority_label(Y[largest_cluster_indices])
             else:
-                np_new_labels[community] = mode(Y[nodes])[0][0]
+                np_new_labels[community] = majority_label(Y[nodes])
 
         end_time = time.time()
         time_agg_label = end_time - start_time
@@ -395,9 +633,9 @@ class GraphCommunityPartition(Exp):
             selected_nodes = nodes[distances <= threshold]
 
             if len(selected_nodes) > 0:
-                np_new_labels[community] = mode(Y[selected_nodes].cpu().numpy())[0][0]
+                np_new_labels[community] = majority_label(Y[selected_nodes].cpu().numpy())
             else:
-                np_new_labels[community] = mode(Y[nodes].cpu().numpy())[0][0]
+                np_new_labels[community] = majority_label(Y[nodes].cpu().numpy())
 
         end_time = time.time()
         time_agg_label = end_time - start_time
@@ -417,7 +655,7 @@ class GraphCommunityPartition(Exp):
         np_new_labels = np.zeros(len(c2n), dtype='int64')
 
         for community, nodes in c2n.items():
-            np_new_labels[community] = mode(Y[nodes])[0][0]
+            np_new_labels[community] = majority_label(Y[nodes])
 
         self.logger.info('New shapes for label by major.')
         return np_new_labels
@@ -461,26 +699,22 @@ class GraphCommunityPartition(Exp):
         return sim
 
     def calculate_edge_counts(self, n2c, c2n):
-        edge_counts = {}
+        """Directed original-graph edge counts between communities, sparsely.
 
-        # Initialize edge_counts with zeros
-        for community_u in c2n.keys():
-            for community_v in c2n.keys():
-                if community_u != community_v:
-                    edge_counts[(community_u, community_v)] = 0
-
-        # Iterate through all edges in the graph
+        Delegates to ``exp.unlearning_core.calculate_edge_counts`` so that the
+        deployed mapped graph and the post-deletion mapped graph are built by the
+        same code.  Only pairs that carry an edge are stored: pre-allocating every
+        ordered pair is quadratic in the community count, which on Coauthor-CS
+        with held-out evaluation nodes (~5,600 communities) is ~31 million
+        dictionary entries before a single edge is read.  The returned counts are
+        identical -- the previous version only differed by also storing zeros, and
+        every reader accesses it through ``.get(key, 0)``.
+        """
+        del c2n  # the mapping is fully described by n2c
         src, dst = self.graph.edges()
-        for u, v in zip(src.numpy(), dst.numpy()):
-            communities_u = n2c[u] if isinstance(n2c[u], list) else [n2c[u]]
-            communities_v = n2c[v] if isinstance(n2c[v], list) else [n2c[v]]
-
-            for community_u in communities_u:
-                for community_v in communities_v:
-                    if community_u != community_v:
-                        edge_counts[(community_u, community_v)] += 1
-
-        return edge_counts
+        if hasattr(src, 'cpu'):
+            src, dst = src.cpu(), dst.cpu()
+        return core_calculate_edge_counts(src.numpy(), dst.numpy(), n2c)
 
     def calculate_sim(self, n2c, c2n):
         sim = self.aggregate_edges_jaccard_op(n2c, c2n)
@@ -521,56 +755,28 @@ class GraphCommunityPartition(Exp):
         """
         self.logger.info('Using similarity measure: node-based, Jaccard with edge robustness')
 
-        test_edge_method = self.args['test_edge_method']
-
-        # sim[(A,B)] := similarity between community A and B
-        sim = {}
-        # community_set: dictionary
-        # key: community
-        # val: set of its member nodes
-        community_set = {}
+        del n_communities  # the community ids are exactly the keys of c2n
 
         edge_counts = self.calculate_edge_counts(n2c, c2n)
 
-        # Calculate community sets
-        for community in c2n:
-            community_set[community] = set(c2n[community])
+        # community_set: dictionary
+        # key: community
+        # val: set of its member nodes
+        community_set = {community: set(c2n[community]) for community in c2n}
 
-        for i in range(n_communities):
-            for j in range(i + 1, n_communities):
-                if i in community_set and j in community_set:
-                    edge_count_bet_ij = edge_counts.get((i, j), 0)
-                    if edge_count_bet_ij > 0:
-                        union_size_val = len(community_set[i].union(community_set[j]))
-                        jaccard_sim = edge_count_bet_ij / union_size_val
-
-                        edge_count = edge_counts.get((i, j), 0)
-                        out_degree_A = sum(edge_counts.get((i, k), 0) for k in range(n_communities) if k != i)
-                        in_degree_B = sum(edge_counts.get((k, j), 0) for k in range(n_communities) if k != j)
-
-
-                        if out_degree_A > 0 and in_degree_B > 0:
-                            if test_edge_method == 0:
-                                robustness_A2B = (edge_count / math.sqrt(out_degree_A)) * (edge_count / math.sqrt(in_degree_B))
-                            elif test_edge_method == 1:
-                                robustness_A2B = log(1 + edge_count) / (log(1 + out_degree_A) + log(1 + in_degree_B))
-                            elif test_edge_method == 2:
-                                log_edge_count = math.log1p(edge_count)
-                                log_out_degree_A = math.log1p(out_degree_A)
-                                log_in_degree_B = math.log1p(in_degree_B)
-                                robustness_A2B = (log_edge_count / math.sqrt(log_out_degree_A)) * (log_edge_count / math.sqrt(log_in_degree_B))
-                            elif test_edge_method == 3:
-                                robustness_A2B = 0
-                            else:
-                                raise ValueError("Invalid test_edge_method. Choose from 0, 1, 2.")
-
-                            # print(f"({i}, {j}): {robustness_A2B}, {jaccard_sim}")
-
-                            final_score = robustness_A2B + jaccard_sim
-
-                            if final_score != 0:
-                                sim[(i, j)] = final_score
-                                sim[(j, i)] = final_score
+        # Sparse Equation (11).  The previous formulation scanned all
+        # n_communities^2 / 2 ordered pairs and recomputed both degree normalisers
+        # with an inner loop over every community for each connected pair, i.e.
+        # O(C^2 + P*C); this is O(P log P) after one pass over the edge counts.
+        # `pair_reduction='source'` keeps the historical read-out, s_ij taken from
+        # the (low, high) direction only.
+        sim = calculate_robustness_similarity(
+            c2n,
+            edge_counts,
+            test_edge_method=self.args['test_edge_method'],
+            include_jaccard=True,
+            pair_reduction='source',
+        )
 
         #save data
         set_file = config.COM_PATH + self.args['dataset_name'] + "/" + self.args['partition'] + '_comset'

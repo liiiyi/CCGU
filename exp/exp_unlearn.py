@@ -49,10 +49,15 @@ class Unlearn(Exp):
             else set()
         )
 
+        num_communities_before = self.num_communities
         start_time = time.time()
         influence = self.gen_unlearning_influence(selected_nodes)
+        update_start = time.time()
         self.unlearning(influence)
+        community_update_seconds = time.time() - update_start
+        retrain_start = time.time()
         self.retrain_model()
+        retrain_seconds = time.time() - retrain_start
         self.unlearn_time = time.time() - start_time
 
         self.logger.info(
@@ -61,6 +66,25 @@ class Unlearn(Exp):
             len(influence["unlearning_communities"]),
             self.unlearn_time,
         )
+
+        metrics = {
+            "stage": "unlearn",
+            "num_nodes_original": int(self.num_nodes),
+            "num_unlearned_nodes": len(influence["unlearning_nodes"]),
+            "unlearn_fraction_of_original_nodes": (
+                len(influence["unlearning_nodes"]) / float(self.num_nodes)
+                if self.num_nodes else None
+            ),
+            "num_affected_communities": len(influence["unlearning_communities"]),
+            "num_eligible_training_nodes": int(self.num_eligible_training_nodes),
+            "num_communities_before": int(num_communities_before),
+            "num_communities_after": int(self.num_communities),
+            "community_update_seconds": community_update_seconds,
+            "retrain_seconds": retrain_seconds,
+            "unlearn_seconds": self.unlearn_time,
+        }
+        metrics.update(getattr(self, "retrain_metrics", {}))
+        self.write_metrics(metrics)
 
     def load_data(self):
         """Load the original DGL graph and the deployed mapped-graph artifacts."""
@@ -78,10 +102,46 @@ class Unlearn(Exp):
         nucleus_data = self.data_store.load_nucleus_data(if_sim=0)
         self.new_feats = np.asarray(nucleus_data["new_feats"]).copy()
         self.new_labels = np.asarray(nucleus_data["new_labels"]).copy()
-        self.train_mask = np.asarray(nucleus_data["train_mask"], dtype=bool).copy()
-        self.val_mask = np.asarray(nucleus_data["val_mask"], dtype=bool).copy()
-        self.test_mask = np.asarray(nucleus_data["test_mask"], dtype=bool).copy()
+
+        # Prefer the split the deployed model was actually trained on, so that the
+        # updated model is evaluated on the same held-out mapped nodes.  Fall back
+        # to the mapping stage's masks when Train has not been run yet.
+        masks = None
+        if self.data_store.has_nucleus_masks():
+            candidate = self.data_store.load_nucleus_masks()
+            if int(candidate.get("num_communities", -1)) == int(self.num_communities):
+                masks = candidate
+                self.logger.info(
+                    "using the train/val/test split recorded by the Train stage "
+                    "(seed %s, test_ratio %s)",
+                    candidate.get("random_seed"),
+                    candidate.get("test_ratio"),
+                )
+            else:
+                self.logger.warning(
+                    "stored split covers %s communities but the community file has "
+                    "%d; ignoring it and falling back to the mapping-stage masks",
+                    candidate.get("num_communities"),
+                    self.num_communities,
+                )
+        if masks is None:
+            self.logger.warning(
+                "no deployment split found; using the mapping-stage masks.  Run "
+                "--exp Train first if you want before/after numbers on one split."
+            )
+            masks = nucleus_data
+        self.train_mask = np.asarray(masks["train_mask"], dtype=bool).copy()
+        self.val_mask = np.asarray(masks["val_mask"], dtype=bool).copy()
+        self.test_mask = np.asarray(masks["test_mask"], dtype=bool).copy()
         self.sim = dict(self.data_store.load_nucleus_data(if_sim=1))
+        self.num_classes = self._original_num_classes()
+
+    def _original_num_classes(self):
+        """Output width taken from the original label space, matching Train."""
+        node_data = getattr(self.graph, "ndata", {})
+        if "label" in node_data:
+            return int(node_data["label"].max().item()) + 1
+        return int(np.asarray(self.new_labels).max()) + 1
 
     def gen_unlearning_influence(self, selected_nodes=None):
         """Sample a training-node request and locate every overlapping community."""
@@ -111,9 +171,28 @@ class Unlearn(Exp):
         else:
             raise ValueError("unlearn_ratio must be positive.")
         if num_unlearning_nodes > len(training_nodes):
-            raise ValueError("unlearn_ratio requests more nodes than the training set contains.")
+            raise ValueError(
+                "unlearn_ratio {} requests {} nodes but only {} eligible training "
+                "nodes exist".format(
+                    unlearn_ratio, num_unlearning_nodes, len(training_nodes)
+                )
+            )
+        self.num_eligible_training_nodes = len(training_nodes)
 
-        unlearning_nodes = random.sample(training_nodes, num_unlearning_nodes)
+        # A dedicated RNG, so the sampled request depends only on --random_seed and
+        # not on how much of the global stream the earlier stages happened to draw.
+        sampler = random.Random(self.args["random_seed"])
+        unlearning_nodes = sampler.sample(training_nodes, num_unlearning_nodes)
+        self.logger.info(
+            "unlearning request: %d nodes (%.4f%% of the %d original nodes, %.4f%% "
+            "of the %d eligible training nodes), seed %d",
+            num_unlearning_nodes,
+            100.0 * num_unlearning_nodes / max(1, self.num_nodes),
+            self.num_nodes,
+            100.0 * num_unlearning_nodes / max(1, len(training_nodes)),
+            len(training_nodes),
+            self.args["random_seed"],
+        )
         unlearning_communities = {
             community
             for node in unlearning_nodes
@@ -374,11 +453,17 @@ class Unlearn(Exp):
             return optimizer_model.calculate_sim()
         else:
             raise ValueError("Unknown edge mapping method.")
+        # pair_reduction='source' is what exp_partition uses, so the deployed and
+        # the post-deletion mapped graphs come out of the same rule.  On the
+        # bidirectional DGL benchmark graphs 'source' and 'max' coincide, but on a
+        # genuinely directed graph they do not, and disagreeing here would mean an
+        # unlearning request silently rebuilt edges the deployment never had.
         return calculate_robustness_similarity(
             self.c2n,
             edge_counts,
             test_edge_method=test_edge_method,
             include_jaccard=include_jaccard,
+            pair_reduction="source",
         )
 
     def calculate_sim2edge_threshold(self):
@@ -468,7 +553,9 @@ class Unlearn(Exp):
             raise ValueError("No mapped training nodes remain after unlearning.")
 
         num_feats = features.shape[1]
-        num_classes = int(labels.max().item()) + 1
+        # Must match the head that Train built, otherwise before/after Macro F1
+        # are computed over different label spaces.
+        num_classes = max(self.num_classes, int(labels.max().item()) + 1)
         model = NodeClassifierDGL(num_feats, num_classes, self.args).to(device)
         optimizer = torch.optim.Adam(
             model.parameters(),
@@ -515,11 +602,25 @@ class Unlearn(Exp):
             labels,
             test_mask,
         )
+        val_f1 = self._mask_f1(model, graph, features, labels, val_mask)
+        val_acc = self._mask_accuracy(model, graph, features, labels, val_mask)
         self.logger.info(
             "Updated mapped graph test macro-F1 %.6f, accuracy %.6f",
             test_f1,
             test_acc,
         )
+        self.retrain_metrics = {
+            "mapped_graph_nodes": int(graph.number_of_nodes()),
+            "mapped_graph_edges": int(graph.number_of_edges()),
+            "train_nodes": int(train_mask.sum().item()),
+            "val_nodes": int(val_mask.sum().item()),
+            "test_nodes": int(test_mask.sum().item()),
+            "num_classes": int(num_classes),
+            "val_macro_f1": val_f1,
+            "val_accuracy": val_acc,
+            "test_macro_f1": test_f1,
+            "test_accuracy": test_acc,
+        }
 
         model_path = self.data_store.target_model_file + "_unlearned.pt"
         torch.save(
@@ -533,6 +634,7 @@ class Unlearn(Exp):
             model_path,
         )
         self.logger.info("Updated model saved to %s", model_path)
+        self.retrain_metrics["model_path"] = model_path
         return model
 
     @staticmethod

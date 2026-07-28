@@ -42,6 +42,7 @@ class DataStore:
 
         self.nucleus_file = config.NU_PATH + self.dataset_name + "/" + self.args['partition'] + '_' + agg_mask
         self.nugraph_file = config.NU_PATH + self.dataset_name + "/" + self.generate_nugraph_file_name()
+        self.nucleus_masks_file = self.nugraph_file + '_masks'
         self.train_test_split_file =  processed_data_prefix + "train_test_split" + str(self.args['test_ratio'])
         self.train_data_file = processed_data_prefix + "train_data"
         self.train_graph_file = processed_data_prefix + "train_graph"
@@ -193,6 +194,23 @@ class DataStore:
     def load_nucleus_graph(self):
         self.logger.info('loading nucleus data')
         return pickle.load(open(self.nugraph_file, 'rb'))
+
+    def save_nucleus_masks(self, masks):
+        """Persist the train/val/test split that the deployed model was trained on.
+
+        Stored in community-id space so the unlearning stage can remap it after
+        empty communities are compacted away, and therefore evaluate the updated
+        model on the same held-out mapped nodes as the deployed one.
+        """
+        self.logger.info('saving nucleus masks to %s', self.nucleus_masks_file)
+        pickle.dump(masks, open(self.nucleus_masks_file, 'wb'))
+
+    def load_nucleus_masks(self):
+        self.logger.info('loading nucleus masks from %s', self.nucleus_masks_file)
+        return pickle.load(open(self.nucleus_masks_file, 'rb'))
+
+    def has_nucleus_masks(self):
+        return os.path.exists(self.nucleus_masks_file)
 
 
 

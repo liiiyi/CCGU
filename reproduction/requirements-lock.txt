@@ -1,0 +1,39 @@
+# Pinned reproduction environment for CCGU / CGE (Python 3.8.19, Linux x86_64).
+#
+# torch==2.1.2+cu121 and dgl==2.2.1+cu121 come from custom wheel indexes and are
+# installed separately by reproduction/scripts/setup_env.sh.
+#
+# Installed by reproduction/scripts/setup_env.sh; see README.md -> "Installation".
+
+# --- core numerics: newest releases that still support Python 3.8 -------------
+numpy==1.24.4
+scipy==1.10.1
+scikit-learn==1.3.2
+networkx==3.1
+pandas==2.0.3
+tqdm==4.66.5
+matplotlib==3.7.5
+
+# --- CUDA 12.1 shared libraries that dgl>=2.2 dlopens ------------------------
+# torch 2.1.2 bundles only some of these inside torch/lib (no libcusparse), so
+# DGL's libdgl.so cannot resolve them.  setup_env.sh symlinks them next to
+# libdgl.so, whose RUNPATH is $ORIGIN.
+nvidia-cuda-runtime-cu12==12.1.105
+nvidia-cublas-cu12==12.1.3.1
+nvidia-cusparse-cu12==12.1.0.106
+nvidia-nvjitlink-cu12==12.1.105
+
+# --- dgl 2.2 import-time dependencies ---------------------------------------
+torchdata==0.7.1
+pydantic==2.5.3
+pyyaml==6.0.1
+requests==2.31.0
+psutil==5.9.8
+
+# --- legacy non-DGL data path (lib_dataset/data_store.py load_raw_data) -----
+torch-geometric==2.4.0
+
+# --- optional community-detection backend -----------------------------------
+# infomap powers `--partition infomap`.  Everything else the pipeline needs
+# (Louvain, CCP, the legacy label-propagation methods) is pure numpy/networkx.
+infomap==2.7.1
