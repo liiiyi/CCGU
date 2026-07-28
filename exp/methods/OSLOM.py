@@ -14,7 +14,8 @@ class OSLOM:
 
         # Configuring CUDA and CPU threads
         torch.set_num_threads(args["num_threads"])
-        torch.cuda.set_device(args["cuda"])
+        if torch.cuda.is_available():
+            torch.cuda.set_device(args["cuda"])
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args["cuda"])
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
