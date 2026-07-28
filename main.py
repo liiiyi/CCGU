@@ -6,22 +6,18 @@ import numpy as np
 import random
 
 from parameter_parser import parameter_parser
-from exp.exp_partition import GraphCommunityPartition
-from exp.exp_train import TrainModel
-from exp.exp_draw import ExpDraw
-from exp.Evaluate import Evaluate
-# from exp.exp_unlearn import Unlearn
-
 def _set_random_seed(seed=2022):
     
     np.random.seed(seed)
     random.seed(seed)
 
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-    torch.backends.cudnn.deterministic = True
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = True
     print("set pytorch seed")
 
 def config_logger(save_name):
@@ -48,20 +44,24 @@ if __name__ == "__main__":
     logging.info(logger_name)
 
     torch.set_num_threads(args["num_threads"])
-    torch.cuda.set_device(args["cuda"])
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args["cuda"])
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args["cuda"])
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 
     if args["exp"].lower() == "partition":
+        from exp.exp_partition import GraphCommunityPartition
         GraphCommunityPartition(args)
     elif args["exp"].lower() == "train":
+        from exp.exp_train import TrainModel
         TrainModel(args)
     elif args["exp"].lower() == "draw":
+        from exp.exp_draw import ExpDraw
         ExpDraw(args)
     elif args["exp"].lower() == "eva":
+        from exp.Evaluate import Evaluate
         Evaluate(args)
-    '''
     elif args["exp"].lower() == "unlearn":
+        from exp.exp_unlearn import Unlearn
         Unlearn(args)
-    '''

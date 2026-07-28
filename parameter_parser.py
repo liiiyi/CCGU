@@ -30,7 +30,8 @@ def parameter_parser():
     parser.add_argument('--if_embed', type=bool, default=False)
 
     ########################## unlearning task parameters ######################
-    # parser.add_argument('--unlearn_task', type=str, default='edge', choices=["edge", "node", 'feature'])
+    parser.add_argument('--unlearn_task', type=str, default='node', choices=["node"],
+                        help='CGE currently implements node unlearning')
     parser.add_argument('--unlearn_ratio', type=float, default=0.1)
 
 

@@ -1,0 +1,13 @@
+# Reproduction environment used by the DGL pipeline.
+# Python 3.8 is recommended to match the paper implementation.
+numpy==1.24.4
+scipy==1.10.1
+scikit-learn==1.3.2
+networkx==3.1
+matplotlib==3.7.5
+tqdm==4.66.5
+torch==2.1.2
+torchdata==0.7.1
+dgl==2.1.0
+torch-geometric==2.4.0
+tensorflow==2.13.1
